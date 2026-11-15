@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="${MERCHROMIO_IMAGE:-localhost/merchromio:latest}"
+if command -v podman >/dev/null 2>&1; then
+    CONTAINER_ENGINE=(podman)
+    CONTAINER_ARGS=(--userns=keep-id)
+elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_ENGINE=(docker)
+    CONTAINER_ARGS=()
+elif command -v flatpak-spawn >/dev/null 2>&1; then
+    CONTAINER_ENGINE=(flatpak-spawn --host podman)
+    CONTAINER_ARGS=(--userns=keep-id)
+else
+    printf 'merchromio requires Podman or Docker.\n' >&2
+    exit 1
+fi
+
+if [[ "$#" -eq 0 ]]; then
+    set -- --help
+fi
+
+exec "${CONTAINER_ENGINE[@]}" run --rm --interactive \
+    "${CONTAINER_ARGS[@]}" \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp \
+    --tmpfs /tmp:rw,size=1g \
+    --volume "$PWD:/work" \
+    --workdir /work \
+    "$IMAGE" \
+    --puppeteerConfigFile /opt/merchromio/puppeteer-config.json \
+    "$@"
