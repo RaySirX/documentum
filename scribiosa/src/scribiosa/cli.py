@@ -17,10 +17,11 @@ FORMATS = {"html": "html", "docx": "docx", "pdf": "pdf"}
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 
 
-def linked_markdown(root: Path) -> list[Path]:
+def linked_markdown(root: Path) -> tuple[list[Path], list[Path]]:
     parser = MarkdownIt()
     pending = deque([root])
     visited: set[Path] = set()
+    references: set[Path] = set()
 
     while pending:
         document = pending.popleft().resolve()
@@ -32,17 +33,26 @@ def linked_markdown(root: Path) -> list[Path]:
 
         for token in parser.parse(document.read_text(encoding="utf-8")):
             for child in token.children or []:
-                if child.type != "link_open":
+                if child.type == "link_open":
+                    target = child.attrGet("href") or ""
+                elif child.type == "image":
+                    target = child.attrGet("src") or ""
+                else:
                     continue
-                href = child.attrGet("href") or ""
-                parsed = urlsplit(href)
+
+                parsed = urlsplit(target)
                 if parsed.scheme or parsed.netloc or not parsed.path:
                     continue
-                linked = (document.parent / unquote(parsed.path)).resolve()
-                if linked.suffix.lower() in MARKDOWN_EXTENSIONS and linked not in visited:
-                    pending.append(linked)
+                referenced = (document.parent / unquote(parsed.path)).resolve()
+                if referenced.suffix.lower() in MARKDOWN_EXTENSIONS:
+                    if not referenced.is_file():
+                        raise click.ClickException(f"Linked Markdown file does not exist: {referenced}")
+                    if referenced not in visited:
+                        pending.append(referenced)
+                elif referenced.is_file():
+                    references.add(referenced)
 
-    return sorted(visited)
+    return sorted(visited), sorted(references)
 
 
 def output_path(document: Path, source_root: Path, destination: Path, extension: str) -> Path:
@@ -50,16 +60,42 @@ def output_path(document: Path, source_root: Path, destination: Path, extension:
     return destination / relative.with_suffix(f".{extension}")
 
 
-def convert(source: Path, destination: Path, output_format: str) -> None:
+def convert(
+    source: Path, destination: Path, output_format: str, stylesheet: Path | None = None
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "pandoc", str(source), "--standalone", "--from", "markdown", "--to", output_format,
+        "--lua-filter", str(files("scribiosa").joinpath("link-target.lua")),
+    ]
+    if output_format == "html" and stylesheet is not None:
+        command.extend(["--css", os.path.relpath(stylesheet, destination.parent)])
+    command.extend(["--output", str(destination)])
     subprocess.run(
-        [
-            "pandoc", str(source), "--standalone", "--from", "markdown", "--to", output_format,
-            "--lua-filter", str(files("scribiosa").joinpath("link-target.lua")),
-            "--output", str(destination),
-        ],
+        command,
         check=True,
     )
+
+
+def copy_references(references: list[Path], source_root: Path, destination: Path) -> list[Path]:
+    copied: list[Path] = []
+    for reference in references:
+        relative = reference.relative_to(source_root)
+        output = destination / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(reference, output)
+        copied.append(output)
+        click.echo(f"Copied {output}")
+    return copied
+
+
+def copy_stylesheet(destination: Path) -> Path:
+    stylesheet = destination / "github.css"
+    stylesheet.parent.mkdir(parents=True, exist_ok=True)
+    with files("scribiosa").joinpath("github.css").open("rb") as source:
+        with stylesheet.open("wb") as target:
+            shutil.copyfileobj(source, target)
+    return stylesheet
 
 
 def build_report(
@@ -71,6 +107,10 @@ def build_report(
     started: datetime,
 ) -> str:
     lines = [
+        "---",
+        "title: Build Report",
+        "---",
+        "",
         "# Build Report",
         "",
         "## Build Information",
@@ -85,7 +125,7 @@ def build_report(
         "",
         "## Build Log",
         "",
-        f"- Converted {len(outputs)} document-format file(s).",
+        f"- Generated {len(outputs)} document and asset file(s).",
         "",
         "## Root Document",
         "",
@@ -123,17 +163,28 @@ def conjure(root_document: Path, format_name: str, output_dir: Path | None,
     destination = output_dir.resolve() if output_dir else Path(tempfile.mkdtemp(prefix="scribiosa-"))
     formats = list(FORMATS) if format_name == "all" else [format_name]
     started = datetime.now(timezone.utc)
-    documents = linked_markdown(root)
+    documents, references = linked_markdown(root)
     source_root = Path(
-        os.path.commonpath([str(root.parent), *(str(document.parent) for document in documents)])
+        os.path.commonpath(
+            [
+                str(root.parent),
+                *(str(document.parent) for document in documents),
+                *(str(reference.parent) for reference in references),
+            ]
+        )
     )
     outputs: list[Path] = []
 
     try:
+        outputs.extend(copy_references(references, source_root, destination))
+        stylesheet = copy_stylesheet(destination) if "html" in formats else None
+        if stylesheet is not None:
+            outputs.append(stylesheet)
+
         for document in documents:
             for selected_format in formats:
                 output = output_path(document, source_root, destination, selected_format)
-                convert(document, output, FORMATS[selected_format])
+                convert(document, output, FORMATS[selected_format], stylesheet)
                 outputs.append(output)
                 click.echo(f"Generated {output}")
 
@@ -144,7 +195,7 @@ def conjure(root_document: Path, format_name: str, output_dir: Path | None,
                 report_source.write_text(report_markdown, encoding="utf-8")
                 for selected_format in formats:
                     report_output = destination / f"build-report.{selected_format}"
-                    convert(report_source, report_output, FORMATS[selected_format])
+                    convert(report_source, report_output, FORMATS[selected_format], stylesheet)
                     outputs.append(report_output)
                     click.echo(f"Generated {report_output}")
     except subprocess.CalledProcessError as error:
